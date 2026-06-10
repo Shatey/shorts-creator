@@ -6,7 +6,7 @@ public record ClipCandidate(int index, double startSeconds, double durationSecon
     }
 
     public String displayRange() {
-        return formatTime(startSeconds) + " - " + formatTime(endSeconds());
+        return formatTime(startSeconds) + " - " + formatTime(endSeconds()) + " (" + Math.round(durationSeconds) + "s)";
     }
 
     public static String formatTime(double seconds) {

@@ -15,6 +15,9 @@ import java.util.Optional;
 import java.util.function.DoubleConsumer;
 
 public final class FfmpegService {
+    private static final int FOCUS_SAMPLE_WIDTH = 160;
+    private static final int FOCUS_SAMPLE_HEIGHT = 90;
+
     public void verifyInstalled() throws IOException, InterruptedException {
         try {
             ProcessResult ffmpeg = runAndCapture(List.of(ffmpegCommand(), "-version"));
@@ -29,17 +32,37 @@ public final class FfmpegService {
     }
 
     public double readDurationSeconds(Path inputFile) throws IOException, InterruptedException {
+        return readVideoInfo(inputFile).durationSeconds();
+    }
+
+    public VideoInfo readVideoInfo(Path inputFile) throws IOException, InterruptedException {
         ProcessResult result = runAndCapture(List.of(
                 ffprobeCommand(),
                 "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height:format=duration",
+                "-of", "default=noprint_wrappers=1",
                 inputFile.toString()
         ));
         if (!result.isSuccess()) {
-            throw new IOException("Could not read video duration:\n" + result.output());
+            throw new IOException("Could not read video info:\n" + result.output());
         }
-        return Double.parseDouble(result.output().trim());
+        int width = 0;
+        int height = 0;
+        double duration = 0;
+        for (String line : result.output().split("\\R")) {
+            if (line.startsWith("width=")) {
+                width = Integer.parseInt(line.substring("width=".length()).trim());
+            } else if (line.startsWith("height=")) {
+                height = Integer.parseInt(line.substring("height=".length()).trim());
+            } else if (line.startsWith("duration=")) {
+                duration = Double.parseDouble(line.substring("duration=".length()).trim());
+            }
+        }
+        if (width <= 0 || height <= 0 || duration <= 0) {
+            throw new IOException("Could not read video dimensions/duration:\n" + result.output());
+        }
+        return new VideoInfo(width, height, duration);
     }
 
     public List<Double> readAudioRms(Path inputFile, double bucketSeconds, DoubleConsumer progress)
@@ -113,6 +136,8 @@ public final class FfmpegService {
         Files.createDirectories(outputDirectory);
         String name = String.format(Locale.US, "short_%02d_%s.mp4", clip.index(), safeTime(clip.startSeconds()));
         Path output = outputDirectory.resolve(name);
+        VideoInfo info = readVideoInfo(inputFile);
+        double focusX = estimateVisualFocusX(inputFile, clip);
 
         List<String> command = List.of(
                 ffmpegCommand(),
@@ -120,7 +145,7 @@ public final class FfmpegService {
                 "-ss", formatSeconds(clip.startSeconds()),
                 "-i", inputFile.toString(),
                 "-t", formatSeconds(clip.durationSeconds()),
-                "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1",
+                "-vf", buildShortsFilter(info, focusX),
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-crf", "23",
@@ -135,6 +160,143 @@ public final class FfmpegService {
             throw new IOException("Clip export failed (" + clip.index() + "/" + totalCount + "):\n" + result.output());
         }
         return output;
+    }
+
+    private double estimateVisualFocusX(Path inputFile, ClipCandidate clip) throws IOException, InterruptedException {
+        List<String> command = List.of(
+                ffmpegCommand(),
+                "-v", "error",
+                "-ss", formatSeconds(clip.startSeconds()),
+                "-i", inputFile.toString(),
+                "-t", formatSeconds(Math.min(clip.durationSeconds(), 20)),
+                "-vf", "fps=2,scale=" + FOCUS_SAMPLE_WIDTH + ":" + FOCUS_SAMPLE_HEIGHT + ":force_original_aspect_ratio=decrease,"
+                        + "pad=" + FOCUS_SAMPLE_WIDTH + ":" + FOCUS_SAMPLE_HEIGHT + ":(ow-iw)/2:(oh-ih)/2",
+                "-an",
+                "-f", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "pipe:1"
+        );
+
+        ProcessBuilder builder = new ProcessBuilder(command);
+        Process process = builder.start();
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        Thread errorReader = new Thread(() -> {
+            try (InputStream in = process.getErrorStream()) {
+                in.transferTo(errors);
+            } catch (IOException ignored) {
+                // A failed process is handled after waitFor().
+            }
+        }, "ffmpeg-focus-error-reader");
+        errorReader.start();
+
+        int frameSize = FOCUS_SAMPLE_WIDTH * FOCUS_SAMPLE_HEIGHT * 3;
+        byte[] frame = new byte[frameSize];
+        byte[] previousGray = null;
+        double[] columnScores = new double[FOCUS_SAMPLE_WIDTH];
+        int frames = 0;
+
+        try (InputStream in = process.getInputStream()) {
+            while (readFully(in, frame)) {
+                byte[] gray = new byte[FOCUS_SAMPLE_WIDTH * FOCUS_SAMPLE_HEIGHT];
+                for (int y = 0; y < FOCUS_SAMPLE_HEIGHT; y++) {
+                    for (int x = 0; x < FOCUS_SAMPLE_WIDTH; x++) {
+                        int pixel = (y * FOCUS_SAMPLE_WIDTH + x) * 3;
+                        int r = frame[pixel] & 0xff;
+                        int g = frame[pixel + 1] & 0xff;
+                        int b = frame[pixel + 2] & 0xff;
+                        int value = (r * 30 + g * 59 + b * 11) / 100;
+                        gray[y * FOCUS_SAMPLE_WIDTH + x] = (byte) value;
+                    }
+                }
+
+                for (int y = 1; y < FOCUS_SAMPLE_HEIGHT - 1; y++) {
+                    for (int x = 1; x < FOCUS_SAMPLE_WIDTH - 1; x++) {
+                        int index = y * FOCUS_SAMPLE_WIDTH + x;
+                        int current = gray[index] & 0xff;
+                        int contrast = Math.abs(current - (gray[index - 1] & 0xff))
+                                + Math.abs(current - (gray[index + 1] & 0xff))
+                                + Math.abs(current - (gray[index - FOCUS_SAMPLE_WIDTH] & 0xff))
+                                + Math.abs(current - (gray[index + FOCUS_SAMPLE_WIDTH] & 0xff));
+                        int motion = previousGray == null ? 0 : Math.abs(current - (previousGray[index] & 0xff));
+                        columnScores[x] += contrast * 0.35 + motion * 1.65;
+                    }
+                }
+                previousGray = gray;
+                frames++;
+            }
+        }
+
+        int exit = process.waitFor();
+        errorReader.join();
+        if (exit != 0 || frames == 0) {
+            return 0.5;
+        }
+
+        smooth(columnScores);
+        int bestX = bestColumnForShortsWindow(columnScores);
+        return bestX / (double) Math.max(1, FOCUS_SAMPLE_WIDTH - 1);
+    }
+
+    private boolean readFully(InputStream in, byte[] buffer) throws IOException {
+        int offset = 0;
+        while (offset < buffer.length) {
+            int read = in.read(buffer, offset, buffer.length - offset);
+            if (read == -1) {
+                return offset == 0 ? false : false;
+            }
+            offset += read;
+        }
+        return true;
+    }
+
+    private void smooth(double[] scores) {
+        double[] copy = scores.clone();
+        for (int i = 0; i < scores.length; i++) {
+            double sum = 0;
+            int count = 0;
+            for (int j = Math.max(0, i - 4); j <= Math.min(scores.length - 1, i + 4); j++) {
+                sum += copy[j];
+                count++;
+            }
+            scores[i] = sum / count;
+        }
+    }
+
+    private int bestColumnForShortsWindow(double[] scores) {
+        int shortsWidth = Math.max(1, (int) Math.round(FOCUS_SAMPLE_HEIGHT * 9.0 / 16.0));
+        int bestStart = 0;
+        double bestScore = Double.NEGATIVE_INFINITY;
+        for (int start = 0; start <= scores.length - shortsWidth; start++) {
+            double score = 0;
+            for (int x = start; x < start + shortsWidth; x++) {
+                score += scores[x];
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                bestStart = start;
+            }
+        }
+        return bestStart + shortsWidth / 2;
+    }
+
+    private String buildShortsFilter(VideoInfo info, double focusX) {
+        double targetAspect = 9.0 / 16.0;
+        if (info.isWideForShorts()) {
+            int cropWidth = even((int) Math.round(info.height() * targetAspect));
+            int maxX = Math.max(0, info.width() - cropWidth);
+            int x = even((int) Math.round(focusX * info.width() - cropWidth / 2.0));
+            x = Math.max(0, Math.min(maxX, x));
+            return "crop=" + cropWidth + ":" + info.height() + ":" + x + ":0,scale=1080:1920,setsar=1";
+        }
+
+        int cropHeight = even((int) Math.round(info.width() / targetAspect));
+        cropHeight = Math.min(cropHeight, info.height());
+        int y = Math.max(0, (info.height() - cropHeight) / 2);
+        return "crop=" + info.width() + ":" + cropHeight + ":0:" + y + ",scale=1080:1920,setsar=1";
+    }
+
+    private int even(int value) {
+        return Math.max(2, value - Math.floorMod(value, 2));
     }
 
     private ProcessResult runAndCapture(List<String> command) throws IOException, InterruptedException {

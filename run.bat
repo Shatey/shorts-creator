@@ -21,5 +21,5 @@ if "%~1"=="--build-only" (
   exit /b 0
 )
 
-java -cp out\classes com.shortscreator.Main
+start "" javaw -cp out\classes com.shortscreator.Main
 endlocal

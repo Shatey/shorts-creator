@@ -6,6 +6,7 @@ public record ExportSettings(
         Path inputFile,
         Path outputDirectory,
         int clipCount,
-        int clipDurationSeconds
+        int clipDurationSeconds,
+        boolean detectAllMoments
 ) {
 }

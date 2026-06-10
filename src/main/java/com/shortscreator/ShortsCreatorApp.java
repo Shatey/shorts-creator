@@ -3,6 +3,7 @@ package com.shortscreator;
 import javax.swing.BorderFactory;
 import javax.swing.DefaultListModel;
 import javax.swing.JButton;
+import javax.swing.JCheckBox;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
@@ -28,13 +29,17 @@ import java.awt.Insets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.prefs.Preferences;
 
 public final class ShortsCreatorApp {
+    private static final String LAST_VIDEO_DIRECTORY = "lastVideoDirectory";
+
     private final JFrame frame = new JFrame("Shorts Creator");
     private final JTextField inputField = new JTextField();
     private final JTextField outputField = new JTextField();
-    private final JSpinner countSpinner = new JSpinner(new SpinnerNumberModel(5, 1, 20, 1));
-    private final JSpinner durationSpinner = new JSpinner(new SpinnerNumberModel(45, 10, 60, 5));
+    private final JSpinner countSpinner = new JSpinner(new SpinnerNumberModel(5, 1, 100, 1));
+    private final JCheckBox allMomentsCheckBox = new JCheckBox("All moments");
+    private final JSpinner durationSpinner = new JSpinner(new SpinnerNumberModel(45, VideoAnalyzer.MIN_CLIP_SECONDS, 60, 5));
     private final JButton analyzeButton = new JButton("Analyze");
     private final JButton exportButton = new JButton("Export");
     private final JProgressBar progressBar = new JProgressBar(0, 100);
@@ -44,7 +49,9 @@ public final class ShortsCreatorApp {
 
     private final FfmpegService ffmpeg = new FfmpegService();
     private final VideoAnalyzer analyzer = new VideoAnalyzer(ffmpeg);
+    private final Preferences preferences = Preferences.userNodeForPackage(ShortsCreatorApp.class);
     private Path currentInput;
+    private Path currentOutputDirectory;
 
     public void show() {
         setSystemLookAndFeel();
@@ -83,9 +90,13 @@ public final class ShortsCreatorApp {
         addButton(panel, c, browseOutput, 2, 1);
 
         addLabel(panel, c, "Shorts", 0, 2);
-        addButton(panel, c, countSpinner, 1, 2);
+        JPanel countPanel = new JPanel(new BorderLayout(8, 0));
+        countPanel.add(countSpinner, BorderLayout.WEST);
+        countPanel.add(allMomentsCheckBox, BorderLayout.CENTER);
+        allMomentsCheckBox.addActionListener(e -> countSpinner.setEnabled(!allMomentsCheckBox.isSelected()));
+        addButton(panel, c, countPanel, 1, 2);
 
-        addLabel(panel, c, "Length, sec", 0, 3);
+        addLabel(panel, c, "Max length, sec", 0, 3);
         addButton(panel, c, durationSpinner, 1, 3);
 
         analyzeButton.addActionListener(e -> analyze());
@@ -148,16 +159,22 @@ public final class ShortsCreatorApp {
         currentInput = settings.inputFile();
         setBusy(true);
         clipModel.clear();
-        log("Checking FFmpeg...");
+        currentInput = null;
+        currentOutputDirectory = null;
+        log("Checking tools...");
 
         SwingWorker<List<ClipCandidate>, String> worker = new SwingWorker<>() {
             @Override
             protected List<ClipCandidate> doInBackground() throws Exception {
                 ffmpeg.verifyInstalled();
+                Path input = settings.inputFile();
+                Path output = settings.outputDirectory();
+                currentInput = input;
+                currentOutputDirectory = output;
                 publish("Analyzing audio activity...");
                 return analyzer.findCandidates(
-                        settings.inputFile(),
-                        settings.clipCount(),
+                        input,
+                        settings.detectAllMoments() ? VideoAnalyzer.ALL_MOMENTS : settings.clipCount(),
                         settings.clipDurationSeconds(),
                         progress -> setProgress((int) Math.round(progress * 100))
                 );
@@ -191,8 +208,8 @@ public final class ShortsCreatorApp {
     }
 
     private void export() {
-        ExportSettings settings = readSettings();
-        if (settings == null) {
+        if (currentInput == null || currentOutputDirectory == null) {
+            JOptionPane.showMessageDialog(frame, "Analyze a video before exporting.");
             return;
         }
 
@@ -211,7 +228,7 @@ public final class ShortsCreatorApp {
                 for (int i = 0; i < clips.size(); i++) {
                     ClipCandidate clip = clips.get(i);
                     publish("Exporting " + clip.displayRange() + "...");
-                    Path output = ffmpeg.exportClip(settings.inputFile(), settings.outputDirectory(), clip, clips.size());
+                    Path output = ffmpeg.exportClip(currentInput, currentOutputDirectory, clip, clips.size());
                     publish("Saved " + output);
                     setProgress((int) Math.round(((i + 1) / (double) clips.size()) * 100));
                 }
@@ -254,22 +271,25 @@ public final class ShortsCreatorApp {
             JOptionPane.showMessageDialog(frame, "Input video does not exist.");
             return null;
         }
+        Path output = Path.of(outputField.getText());
+        output = outputDirectoryFor(input, output);
         return new ExportSettings(
                 input,
-                Path.of(outputField.getText()),
+                output,
                 (Integer) countSpinner.getValue(),
-                (Integer) durationSpinner.getValue()
+                (Integer) durationSpinner.getValue(),
+                allMomentsCheckBox.isSelected()
         );
     }
 
     private void chooseInput() {
-        JFileChooser chooser = new JFileChooser();
+        JFileChooser chooser = new JFileChooser(lastVideoDirectory().toFile());
         chooser.setFileFilter(new FileNameExtensionFilter("Video files", "mkv", "mp4", "mov", "webm", "avi"));
         if (chooser.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION) {
-            inputField.setText(chooser.getSelectedFile().toPath().toString());
-            if (outputField.getText().isBlank()) {
-                outputField.setText(chooser.getSelectedFile().toPath().getParent().resolve("shorts").toString());
-            }
+            Path input = chooser.getSelectedFile().toPath();
+            inputField.setText(input.toString());
+            saveLastVideoDirectory(input.getParent());
+            outputField.setText(defaultOutputDirectory(input).toString());
         }
     }
 
@@ -277,7 +297,50 @@ public final class ShortsCreatorApp {
         JFileChooser chooser = new JFileChooser();
         chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
         if (chooser.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION) {
-            outputField.setText(chooser.getSelectedFile().toPath().toString());
+            Path selected = chooser.getSelectedFile().toPath();
+            if (!inputField.getText().isBlank()) {
+                selected = outputDirectoryFor(Path.of(inputField.getText()), selected);
+            }
+            outputField.setText(selected.toString());
+        }
+    }
+
+    private Path defaultOutputDirectory(Path input) {
+        return input.getParent().resolve(videoBaseName(input));
+    }
+
+    private Path outputDirectoryFor(Path input, Path selectedDirectory) {
+        String expectedName = videoBaseName(input);
+        Path fileName = selectedDirectory.getFileName();
+        if (fileName != null && fileName.toString().equalsIgnoreCase(expectedName)) {
+            return selectedDirectory;
+        }
+        return selectedDirectory.resolve(expectedName);
+    }
+
+    private String videoBaseName(Path input) {
+        String fileName = input.getFileName().toString();
+        int dot = fileName.lastIndexOf('.');
+        if (dot > 0) {
+            return fileName.substring(0, dot);
+        }
+        return fileName;
+    }
+
+    private Path lastVideoDirectory() {
+        String saved = preferences.get(LAST_VIDEO_DIRECTORY, "");
+        if (!saved.isBlank()) {
+            Path path = Path.of(saved);
+            if (Files.isDirectory(path)) {
+                return path;
+            }
+        }
+        return Path.of(System.getProperty("user.home"));
+    }
+
+    private void saveLastVideoDirectory(Path directory) {
+        if (directory != null && Files.isDirectory(directory)) {
+            preferences.put(LAST_VIDEO_DIRECTORY, directory.toString());
         }
     }
 
