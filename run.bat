@@ -16,6 +16,10 @@ if errorlevel 1 (
   exit /b 1
 )
 
+if exist src\main\resources (
+  xcopy /e /i /y src\main\resources out\classes >nul
+)
+
 if "%~1"=="--build-only" (
   echo Build succeeded.
   exit /b 0

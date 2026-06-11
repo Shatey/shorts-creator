@@ -3,26 +3,43 @@ package com.shortscreator;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.DoubleConsumer;
 
 public final class FfmpegService {
     private static final int FOCUS_SAMPLE_WIDTH = 160;
     private static final int FOCUS_SAMPLE_HEIGHT = 90;
+    private final List<Process> runningProcesses = Collections.synchronizedList(new ArrayList<>());
+
+    public void cancelRunningProcesses() {
+        List<Process> snapshot;
+        synchronized (runningProcesses) {
+            snapshot = new ArrayList<>(runningProcesses);
+        }
+        for (Process process : snapshot) {
+            if (process.isAlive()) {
+                process.destroy();
+            }
+        }
+    }
 
     public void verifyInstalled() throws IOException, InterruptedException {
         try {
             ProcessResult ffmpeg = runAndCapture(List.of(ffmpegCommand(), "-version"));
             ProcessResult ffprobe = runAndCapture(List.of(ffprobeCommand(), "-version"));
-            if (ffmpeg.isSuccess() && ffprobe.isSuccess()) {
+            ProcessResult ffplay = runAndCapture(List.of(ffplayCommand(), "-version"));
+            if (ffmpeg.isSuccess() && ffprobe.isSuccess() && ffplay.isSuccess()) {
                 return;
             }
         } catch (IOException ex) {
@@ -67,21 +84,28 @@ public final class FfmpegService {
 
     public List<Double> readAudioRms(Path inputFile, double bucketSeconds, DoubleConsumer progress)
             throws IOException, InterruptedException {
+        return readAudioRms(inputFile, bucketSeconds, List.of(), progress);
+    }
+
+    public List<Double> readAudioRms(Path inputFile, double bucketSeconds, List<Integer> audioStreamIndexes,
+                                     DoubleConsumer progress)
+            throws IOException, InterruptedException {
+        List<AudioTrackSelection> selections = audioStreamIndexes.stream()
+                .map(index -> new AudioTrackSelection(index, 1.0))
+                .toList();
+        return readAudioRmsWithSelections(inputFile, bucketSeconds, selections, progress);
+    }
+
+    public List<Double> readAudioRmsWithSelections(Path inputFile, double bucketSeconds,
+                                                   List<AudioTrackSelection> audioTrackSelections,
+                                                   DoubleConsumer progress)
+            throws IOException, InterruptedException {
         int sampleRate = 8_000;
         int samplesPerBucket = Math.max(1, (int) Math.round(sampleRate * bucketSeconds));
-        List<String> command = List.of(
-                ffmpegCommand(),
-                "-v", "error",
-                "-i", inputFile.toString(),
-                "-vn",
-                "-ac", "1",
-                "-ar", Integer.toString(sampleRate),
-                "-f", "s16le",
-                "pipe:1"
-        );
+        List<String> command = buildAudioPcmCommand(inputFile, audioTrackSelections, sampleRate);
 
         ProcessBuilder builder = new ProcessBuilder(command);
-        Process process = builder.start();
+        Process process = startManagedProcess(builder);
         ByteArrayOutputStream errors = new ByteArrayOutputStream();
         Thread errorReader = new Thread(() -> {
             try (InputStream in = process.getErrorStream()) {
@@ -131,7 +155,110 @@ public final class FfmpegService {
         return buckets;
     }
 
-    public Path exportClip(Path inputFile, Path outputDirectory, ClipCandidate clip, int totalCount)
+    public List<AudioTrack> readAudioTracks(Path inputFile) throws IOException, InterruptedException {
+        ProcessResult result = runAndCapture(List.of(
+                ffprobeCommand(),
+                "-v", "error",
+                "-select_streams", "a",
+                "-show_entries", "stream=index,codec_name,channels:stream_tags=language,title",
+                "-of", "default=noprint_wrappers=1",
+                inputFile.toString()
+        ));
+        if (!result.isSuccess()) {
+            throw new IOException("Could not read audio tracks:\n" + result.output());
+        }
+
+        List<AudioTrack> tracks = new ArrayList<>();
+        int streamIndex = -1;
+        int channels = 0;
+        String codec = "";
+        String language = "";
+        String title = "";
+
+        for (String line : result.output().split("\\R")) {
+            if (line.startsWith("index=")) {
+                if (streamIndex >= 0) {
+                    tracks.add(new AudioTrack(streamIndex, tracks.size(), codec, channels, language, title));
+                }
+                streamIndex = parseInt(line.substring("index=".length()), -1);
+                channels = 0;
+                codec = "";
+                language = "";
+                title = "";
+            } else if (line.startsWith("codec_name=")) {
+                codec = line.substring("codec_name=".length()).trim();
+            } else if (line.startsWith("channels=")) {
+                channels = parseInt(line.substring("channels=".length()), 0);
+            } else if (line.startsWith("TAG:language=")) {
+                language = line.substring("TAG:language=".length()).trim();
+            } else if (line.startsWith("TAG:title=")) {
+                title = line.substring("TAG:title=".length()).trim();
+            }
+        }
+        if (streamIndex >= 0) {
+            tracks.add(new AudioTrack(streamIndex, tracks.size(), codec, channels, language, title));
+        }
+        return tracks;
+    }
+
+    public Process previewAudioTrack(Path inputFile, AudioTrack track) throws IOException {
+        return startManagedProcess(new ProcessBuilder(
+                ffplayCommand(),
+                "-autoexit",
+                "-nodisp",
+                "-loglevel", "error",
+                "-ast", "a:" + track.audioIndex(),
+                inputFile.toString()
+        ));
+    }
+
+    public PreviewSession previewAudioTracks(Path inputFile, List<AudioTrackSelection> selections) throws IOException {
+        return previewAudioTracks(inputFile, selections, 0);
+    }
+
+    public PreviewSession previewAudioTracks(Path inputFile, List<AudioTrackSelection> selections, double startSeconds) throws IOException {
+        if (selections == null || selections.isEmpty()) {
+            throw new IOException("Select at least one audio track to preview.");
+        }
+
+        ProcessBuilder ffmpegBuilder = new ProcessBuilder(buildAudioPreviewCommand(inputFile, selections, startSeconds));
+        ffmpegBuilder.redirectError(ProcessBuilder.Redirect.DISCARD);
+        Process ffmpeg = startManagedProcess(ffmpegBuilder);
+
+        ProcessBuilder ffplayBuilder = new ProcessBuilder(
+                ffplayCommand(),
+                "-autoexit",
+                "-nodisp",
+                "-loglevel", "error",
+                "-i", "pipe:0"
+        );
+        ffplayBuilder.redirectError(ProcessBuilder.Redirect.DISCARD);
+        Process ffplay = startManagedProcess(ffplayBuilder);
+
+        CompletableFuture<Void> pipeFuture = CompletableFuture.runAsync(() -> {
+            try (InputStream in = ffmpeg.getInputStream(); var out = ffplay.getOutputStream()) {
+                in.transferTo(out);
+            } catch (IOException ignored) {
+                // Closing either process while stopping preview is expected.
+            }
+        });
+        CompletableFuture<Void> exitFuture = ffplay.onExit()
+                .thenCombine(ffmpeg.onExit(), (left, right) -> null)
+                .thenCombine(pipeFuture.exceptionally(ex -> null), (left, right) -> null);
+        return new PreviewSession(ffmpeg, ffplay, exitFuture);
+    }
+
+    public Path exportClip(Path inputFile, Path outputDirectory, ClipCandidate clip, int totalCount,
+                           List<Integer> audioStreamIndexes)
+            throws IOException, InterruptedException {
+        List<AudioTrackSelection> selections = audioStreamIndexes.stream()
+                .map(index -> new AudioTrackSelection(index, 1.0))
+                .toList();
+        return exportClipWithSelections(inputFile, outputDirectory, clip, totalCount, selections);
+    }
+
+    public Path exportClipWithSelections(Path inputFile, Path outputDirectory, ClipCandidate clip, int totalCount,
+                                         List<AudioTrackSelection> audioTrackSelections)
             throws IOException, InterruptedException {
         Files.createDirectories(outputDirectory);
         String name = String.format(Locale.US, "short_%02d_%s.mp4", clip.index(), safeTime(clip.startSeconds()));
@@ -139,21 +266,7 @@ public final class FfmpegService {
         VideoInfo info = readVideoInfo(inputFile);
         double focusX = estimateVisualFocusX(inputFile, clip);
 
-        List<String> command = List.of(
-                ffmpegCommand(),
-                "-y",
-                "-ss", formatSeconds(clip.startSeconds()),
-                "-i", inputFile.toString(),
-                "-t", formatSeconds(clip.durationSeconds()),
-                "-vf", buildShortsFilter(info, focusX),
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "23",
-                "-c:a", "aac",
-                "-b:a", "160k",
-                "-movflags", "+faststart",
-                output.toString()
-        );
+        List<String> command = buildExportCommand(inputFile, output, clip, buildShortsFilter(info, focusX), audioTrackSelections);
 
         ProcessResult result = runAndCapture(command);
         if (!result.isSuccess()) {
@@ -162,10 +275,16 @@ public final class FfmpegService {
         return output;
     }
 
+    public Path exportClip(Path inputFile, Path outputDirectory, ClipCandidate clip, int totalCount)
+            throws IOException, InterruptedException {
+        return exportClip(inputFile, outputDirectory, clip, totalCount, List.of());
+    }
+
     private double estimateVisualFocusX(Path inputFile, ClipCandidate clip) throws IOException, InterruptedException {
         List<String> command = List.of(
                 ffmpegCommand(),
                 "-v", "error",
+                "-threads", "1",
                 "-ss", formatSeconds(clip.startSeconds()),
                 "-i", inputFile.toString(),
                 "-t", formatSeconds(Math.min(clip.durationSeconds(), 20)),
@@ -178,7 +297,7 @@ public final class FfmpegService {
         );
 
         ProcessBuilder builder = new ProcessBuilder(command);
-        Process process = builder.start();
+        Process process = startManagedProcess(builder);
         ByteArrayOutputStream errors = new ByteArrayOutputStream();
         Thread errorReader = new Thread(() -> {
             try (InputStream in = process.getErrorStream()) {
@@ -237,6 +356,64 @@ public final class FfmpegService {
         return bestX / (double) Math.max(1, FOCUS_SAMPLE_WIDTH - 1);
     }
 
+    public List<Double> readVisualActivity(Path inputFile, double bucketSeconds, DoubleConsumer progress)
+            throws IOException, InterruptedException {
+        double fps = 1.0 / bucketSeconds;
+        List<String> command = List.of(
+                ffmpegCommand(),
+                "-v", "error",
+                "-threads", "1",
+                "-i", inputFile.toString(),
+                "-vf", "fps=" + formatSeconds(fps) + ",scale=" + FOCUS_SAMPLE_WIDTH + ":" + FOCUS_SAMPLE_HEIGHT
+                        + ":force_original_aspect_ratio=decrease,pad=" + FOCUS_SAMPLE_WIDTH + ":" + FOCUS_SAMPLE_HEIGHT
+                        + ":(ow-iw)/2:(oh-ih)/2",
+                "-an",
+                "-f", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "pipe:1"
+        );
+
+        ProcessBuilder builder = new ProcessBuilder(command);
+        Process process = startManagedProcess(builder);
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        Thread errorReader = new Thread(() -> {
+            try (InputStream in = process.getErrorStream()) {
+                in.transferTo(errors);
+            } catch (IOException ignored) {
+                // A failed process is handled after waitFor().
+            }
+        }, "ffmpeg-visual-error-reader");
+        errorReader.start();
+
+        int frameSize = FOCUS_SAMPLE_WIDTH * FOCUS_SAMPLE_HEIGHT * 3;
+        byte[] frame = new byte[frameSize];
+        byte[] previousGray = null;
+        List<Double> activity = new ArrayList<>();
+        int frames = 0;
+
+        try (InputStream in = process.getInputStream()) {
+            while (readFully(in, frame)) {
+                byte[] gray = toGray(frame);
+                double contrast = frameContrast(gray);
+                double motion = previousGray == null ? 0 : frameMotion(gray, previousGray);
+                activity.add(motion * 0.75 + contrast * 0.25);
+                previousGray = gray;
+                frames++;
+                if (progress != null && frames % 20 == 0) {
+                    progress.accept(frames * bucketSeconds);
+                }
+            }
+        }
+
+        int exit = process.waitFor();
+        errorReader.join();
+        if (exit != 0) {
+            String error = errors.toString(StandardCharsets.UTF_8);
+            throw new IOException("FFmpeg visual analysis failed:\n" + error);
+        }
+        return activity;
+    }
+
     private boolean readFully(InputStream in, byte[] buffer) throws IOException {
         int offset = 0;
         while (offset < buffer.length) {
@@ -260,6 +437,45 @@ public final class FfmpegService {
             }
             scores[i] = sum / count;
         }
+    }
+
+    private byte[] toGray(byte[] frame) {
+        byte[] gray = new byte[FOCUS_SAMPLE_WIDTH * FOCUS_SAMPLE_HEIGHT];
+        for (int y = 0; y < FOCUS_SAMPLE_HEIGHT; y++) {
+            for (int x = 0; x < FOCUS_SAMPLE_WIDTH; x++) {
+                int pixel = (y * FOCUS_SAMPLE_WIDTH + x) * 3;
+                int r = frame[pixel] & 0xff;
+                int g = frame[pixel + 1] & 0xff;
+                int b = frame[pixel + 2] & 0xff;
+                gray[y * FOCUS_SAMPLE_WIDTH + x] = (byte) ((r * 30 + g * 59 + b * 11) / 100);
+            }
+        }
+        return gray;
+    }
+
+    private double frameMotion(byte[] current, byte[] previous) {
+        long sum = 0;
+        for (int i = 0; i < current.length; i++) {
+            sum += Math.abs((current[i] & 0xff) - (previous[i] & 0xff));
+        }
+        return sum / (double) (current.length * 255);
+    }
+
+    private double frameContrast(byte[] gray) {
+        long sum = 0;
+        int count = 0;
+        for (int y = 1; y < FOCUS_SAMPLE_HEIGHT - 1; y++) {
+            for (int x = 1; x < FOCUS_SAMPLE_WIDTH - 1; x++) {
+                int index = y * FOCUS_SAMPLE_WIDTH + x;
+                int current = gray[index] & 0xff;
+                sum += Math.abs(current - (gray[index - 1] & 0xff));
+                sum += Math.abs(current - (gray[index + 1] & 0xff));
+                sum += Math.abs(current - (gray[index - FOCUS_SAMPLE_WIDTH] & 0xff));
+                sum += Math.abs(current - (gray[index + FOCUS_SAMPLE_WIDTH] & 0xff));
+                count += 4;
+            }
+        }
+        return sum / (double) (Math.max(1, count) * 255);
     }
 
     private int bestColumnForShortsWindow(double[] scores) {
@@ -299,10 +515,139 @@ public final class FfmpegService {
         return Math.max(2, value - Math.floorMod(value, 2));
     }
 
+    private List<String> buildAudioPcmCommand(Path inputFile, List<AudioTrackSelection> audioTrackSelections, int sampleRate) {
+        List<String> command = new ArrayList<>();
+        command.add(ffmpegCommand());
+        command.add("-v");
+        command.add("error");
+        command.add("-threads");
+        command.add("1");
+        command.add("-i");
+        command.add(inputFile.toString());
+
+        if (audioTrackSelections == null || audioTrackSelections.isEmpty()) {
+            command.add("-vn");
+            command.add("-ac");
+            command.add("1");
+            command.add("-ar");
+            command.add(Integer.toString(sampleRate));
+        } else {
+            command.add("-filter_complex");
+            command.add(buildAudioOutputFilter(audioTrackSelections, true));
+            command.add("-map");
+            command.add("[aout]");
+            command.add("-ar");
+            command.add(Integer.toString(sampleRate));
+        }
+
+        command.add("-f");
+        command.add("s16le");
+        command.add("pipe:1");
+        return command;
+    }
+
+    private List<String> buildAudioPreviewCommand(Path inputFile, List<AudioTrackSelection> selections, double startSeconds) {
+        List<String> command = new ArrayList<>();
+        command.add(ffmpegCommand());
+        command.add("-v");
+        command.add("error");
+        if (startSeconds > 0) {
+            command.add("-ss");
+            command.add(formatSeconds(startSeconds));
+        }
+        command.add("-i");
+        command.add(inputFile.toString());
+        command.add("-filter_complex");
+        command.add(buildAudioOutputFilter(selections, true));
+        command.add("-map");
+        command.add("[aout]");
+        command.add("-f");
+        command.add("wav");
+        command.add("pipe:1");
+        return command;
+    }
+
+    private List<String> buildExportCommand(Path inputFile, Path output, ClipCandidate clip, String videoFilter,
+                                            List<AudioTrackSelection> audioTrackSelections) {
+        List<String> command = new ArrayList<>();
+        command.add(ffmpegCommand());
+        command.add("-y");
+        command.add("-ss");
+        command.add(formatSeconds(clip.startSeconds()));
+        command.add("-i");
+        command.add(inputFile.toString());
+        command.add("-t");
+        command.add(formatSeconds(clip.durationSeconds()));
+
+        if (audioTrackSelections == null || audioTrackSelections.isEmpty()) {
+            command.add("-map");
+            command.add("0:v:0");
+            command.add("-map");
+            command.add("0:a:0?");
+            command.add("-vf");
+            command.add(videoFilter);
+        } else {
+            command.add("-filter_complex");
+            command.add("[0:v:0]" + videoFilter + "[vout];" + buildAudioOutputFilter(audioTrackSelections, false));
+            command.add("-map");
+            command.add("[vout]");
+            command.add("-map");
+            command.add("[aout]");
+        }
+
+        command.add("-c:v");
+        command.add("libx264");
+        command.add("-preset");
+        command.add("veryfast");
+        command.add("-crf");
+        command.add("23");
+        command.add("-c:a");
+        command.add("aac");
+        command.add("-b:a");
+        command.add("160k");
+        command.add("-movflags");
+        command.add("+faststart");
+        command.add(output.toString());
+        return command;
+    }
+
+    private String buildAudioOutputFilter(List<AudioTrackSelection> selections, boolean pcmOutput) {
+        StringBuilder filter = new StringBuilder();
+        for (int i = 0; i < selections.size(); i++) {
+            AudioTrackSelection selection = selections.get(i);
+            filter.append("[0:")
+                    .append(selection.streamIndex())
+                    .append("]volume=")
+                    .append(formatSeconds(selection.volume()))
+                    .append(",aformat=sample_fmts=fltp:channel_layouts=mono[a")
+                    .append(i)
+                    .append("];");
+        }
+        if (selections.size() == 1) {
+            filter.append("[a0]anull");
+        } else {
+            for (int i = 0; i < selections.size(); i++) {
+                filter.append("[a").append(i).append("]");
+            }
+            filter.append("amix=inputs=")
+                    .append(selections.size())
+                    .append(":duration=longest:normalize=0");
+        }
+        filter.append("[aout]");
+        return filter.toString();
+    }
+
+    private String buildAudioMixFilter(List<Integer> audioStreamIndexes, boolean pcmOutput) {
+        List<AudioTrackSelection> selections = audioStreamIndexes.stream()
+                .map(index -> new AudioTrackSelection(index, 1.0))
+                .toList();
+        return buildAudioOutputFilter(selections, pcmOutput);
+    }
+
     private ProcessResult runAndCapture(List<String> command) throws IOException, InterruptedException {
         ProcessBuilder builder = new ProcessBuilder(command);
         builder.redirectErrorStream(true);
-        Process process = builder.start();
+        Process process = startManagedProcess(builder);
 
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         try (InputStream in = process.getInputStream()) {
@@ -310,6 +655,13 @@ public final class FfmpegService {
         }
         int exit = process.waitFor();
         return new ProcessResult(exit, out.toString(StandardCharsets.UTF_8));
+    }
+
+    private Process startManagedProcess(ProcessBuilder builder) throws IOException {
+        Process process = builder.start();
+        runningProcesses.add(process);
+        process.onExit().thenRun(() -> runningProcesses.remove(process));
+        return process;
     }
 
     private String ffmpegCommand() {
@@ -320,23 +672,29 @@ public final class FfmpegService {
         return findTool("ffprobe");
     }
 
+    private String ffplayCommand() {
+        return findTool("ffplay");
+    }
+
     private String findTool(String name) {
         String executable = name + ".exe";
-        List<Path> localCandidates = List.of(
-                Paths.get("ffmpeg", "bin", executable),
-                Paths.get("tools", "ffmpeg", "bin", executable),
-                Paths.get(executable)
-        );
-        for (Path candidate : localCandidates) {
-            if (Files.isRegularFile(candidate)) {
-                return candidate.toString();
+        for (Path baseDirectory : appBaseDirectories()) {
+            List<Path> localCandidates = List.of(
+                    baseDirectory.resolve(Paths.get("ffmpeg", "bin", executable)),
+                    baseDirectory.resolve(Paths.get("tools", "ffmpeg", "bin", executable)),
+                    baseDirectory.resolve(executable)
+            );
+            for (Path candidate : localCandidates) {
+                if (Files.isRegularFile(candidate)) {
+                    return candidate.toString();
+                }
             }
-        }
 
-        Optional<Path> nested = findNestedTool(Paths.get("ffmpeg"), executable)
-                .or(() -> findNestedTool(Paths.get("tools", "ffmpeg"), executable));
-        if (nested.isPresent()) {
-            return nested.get().toString();
+            Optional<Path> nested = findNestedTool(baseDirectory.resolve("ffmpeg"), executable)
+                    .or(() -> findNestedTool(baseDirectory.resolve(Paths.get("tools", "ffmpeg")), executable));
+            if (nested.isPresent()) {
+                return nested.get().toString();
+            }
         }
 
         Optional<Path> installed = findInstalledTool(executable);
@@ -344,6 +702,31 @@ public final class FfmpegService {
             return installed.get().toString();
         }
         return name;
+    }
+
+    private List<Path> appBaseDirectories() {
+        List<Path> directories = new ArrayList<>();
+        directories.add(Paths.get("").toAbsolutePath());
+        applicationDirectory().ifPresent(directories::add);
+        Path javaHome = Paths.get(System.getProperty("java.home", ".")).toAbsolutePath();
+        Path runtimeParent = javaHome.getParent();
+        if (runtimeParent != null) {
+            directories.add(runtimeParent);
+            directories.add(runtimeParent.resolve("app"));
+        }
+        return directories.stream().distinct().toList();
+    }
+
+    private Optional<Path> applicationDirectory() {
+        try {
+            Path location = Path.of(FfmpegService.class.getProtectionDomain()
+                    .getCodeSource()
+                    .getLocation()
+                    .toURI());
+            return Optional.of(Files.isRegularFile(location) ? location.getParent() : location);
+        } catch (URISyntaxException | IllegalArgumentException ex) {
+            return Optional.empty();
+        }
     }
 
     private Optional<Path> findNestedTool(Path root, String executable) {
@@ -387,7 +770,7 @@ public final class FfmpegService {
 
     private IOException missingFfmpegError() {
         return new IOException("""
-                FFmpeg/FFprobe not found.
+                FFmpeg/FFprobe/FFplay not found.
 
                 Run install-ffmpeg.bat, add FFmpeg to PATH, or unpack FFmpeg into the ffmpeg folder next to the app.
                 The app can find ffmpeg\\bin\\ffmpeg.exe and nested folders like ffmpeg\\ffmpeg-...\\bin\\ffmpeg.exe.
@@ -400,5 +783,13 @@ public final class FfmpegService {
 
     private String safeTime(double seconds) {
         return ClipCandidate.formatTime(seconds).replace(':', '-');
+    }
+
+    private int parseInt(String value, int fallback) {
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException ex) {
+            return fallback;
+        }
     }
 }
