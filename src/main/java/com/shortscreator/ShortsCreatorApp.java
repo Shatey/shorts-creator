@@ -51,8 +51,12 @@ public final class ShortsCreatorApp {
     private final JFrame frame = new JFrame();
     private final JTextField inputField = new JTextField();
     private final JTextField outputField = new JTextField();
+    private final JTextField gameTitleField = new JTextField();
+    private final JTextField partNumberField = new JTextField();
     private final JLabel videoLabel = new JLabel();
     private final JLabel outputLabel = new JLabel();
+    private final JLabel gameTitleLabel = new JLabel();
+    private final JLabel partNumberLabel = new JLabel();
     private final JLabel audioTracksLabel = new JLabel();
     private final JLabel shortsLabel = new JLabel();
     private final JLabel lengthLabel = new JLabel();
@@ -69,12 +73,14 @@ public final class ShortsCreatorApp {
     private final JButton previewMixButton = new JButton();
     private final JButton analyzeButton = new JButton();
     private final JButton exportButton = new JButton();
+    private final JButton thumbnailPromptButton = new JButton();
     private final JButton cancelButton = new JButton();
     private final JComboBox<LanguageOption> languageComboBox = new JComboBox<>(new LanguageOption[]{
             new LanguageOption("en", "English"),
             new LanguageOption("ru", "Русский")
     });
     private final JComboBox<AnalysisEngineOption> analysisEngineComboBox = new JComboBox<>();
+    private final JComboBox<VideoPartTypeOption> partTypeComboBox = new JComboBox<>();
     private final JProgressBar progressBar = new JProgressBar(0, 100);
     private final JTextArea logArea = new JTextArea();
     private final DefaultListModel<ClipCandidate> clipModel = new DefaultListModel<>();
@@ -140,23 +146,31 @@ public final class ShortsCreatorApp {
         browseOutputButton.addActionListener(e -> chooseOutput());
         addButton(panel, c, browseOutputButton, 2, 1);
 
-        addLabel(panel, c, audioTracksLabel, 0, 2);
+        addLabel(panel, c, gameTitleLabel, 0, 2);
+        addField(panel, c, gameTitleField, 1, 2);
+        JPanel partPanel = new JPanel(new BorderLayout(8, 0));
+        partPanel.add(partNumberLabel, BorderLayout.WEST);
+        partPanel.add(partNumberField, BorderLayout.CENTER);
+        partPanel.add(partTypeComboBox, BorderLayout.EAST);
+        addButton(panel, c, partPanel, 2, 2);
+
+        addLabel(panel, c, audioTracksLabel, 0, 3);
         audioTracksPanel.setLayout(new javax.swing.BoxLayout(audioTracksPanel, javax.swing.BoxLayout.Y_AXIS));
         JScrollPane audioScroll = new JScrollPane(audioTracksPanel);
         audioScroll.setPreferredSize(new Dimension(640, 124));
         audioScroll.setMinimumSize(new Dimension(420, 112));
-        addAudioScroll(panel, c, audioScroll, 1, 2);
+        addAudioScroll(panel, c, audioScroll, 1, 3);
         previewMixButton.addActionListener(e -> toggleAudioPreviewMix());
-        addButton(panel, c, previewMixButton, 2, 2);
+        addButton(panel, c, previewMixButton, 2, 3);
 
-        addLabel(panel, c, shortsLabel, 0, 3);
+        addLabel(panel, c, shortsLabel, 0, 4);
         JPanel countPanel = new JPanel(new BorderLayout(8, 0));
         countPanel.add(countSpinner, BorderLayout.WEST);
         countPanel.add(allMomentsCheckBox, BorderLayout.CENTER);
         allMomentsCheckBox.addActionListener(e -> countSpinner.setEnabled(!allMomentsCheckBox.isSelected()));
-        addButton(panel, c, countPanel, 1, 3);
+        addButton(panel, c, countPanel, 1, 4);
 
-        addLabel(panel, c, lengthLabel, 0, 4);
+        addLabel(panel, c, lengthLabel, 0, 5);
         JPanel durationPanel = new JPanel(new BorderLayout(8, 0));
         durationPanel.add(minLengthLabel, BorderLayout.WEST);
         durationPanel.add(minDurationSpinner, BorderLayout.CENTER);
@@ -164,12 +178,14 @@ public final class ShortsCreatorApp {
         JPanel maxDurationPanel = new JPanel(new BorderLayout(4, 0));
         maxDurationPanel.add(durationPanel, BorderLayout.WEST);
         maxDurationPanel.add(durationSpinner, BorderLayout.CENTER);
-        addButton(panel, c, maxDurationPanel, 1, 4);
+        addButton(panel, c, maxDurationPanel, 1, 5);
 
         analyzeButton.addActionListener(e -> analyze());
         exportButton.addActionListener(e -> export());
+        thumbnailPromptButton.addActionListener(e -> generateThumbnailPrompts());
         cancelButton.addActionListener(e -> cancelCurrentWork());
         exportButton.setEnabled(false);
+        thumbnailPromptButton.setEnabled(false);
         cancelButton.setEnabled(false);
 
         JPanel languagePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
@@ -182,14 +198,15 @@ public final class ShortsCreatorApp {
         JPanel settingsPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 0));
         settingsPanel.add(languagePanel);
         settingsPanel.add(enginePanel);
-        addButton(panel, c, settingsPanel, 1, 5);
+        addButton(panel, c, settingsPanel, 1, 6);
 
         JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
         actions.add(analyzeButton);
         actions.add(exportButton);
+        actions.add(thumbnailPromptButton);
         actions.add(cancelButton);
         c.gridx = 2;
-        c.gridy = 5;
+        c.gridy = 6;
         c.weightx = 0;
         panel.add(actions, c);
         return panel;
@@ -279,6 +296,7 @@ public final class ShortsCreatorApp {
                         clipList.setSelectionInterval(0, clips.size() - 1);
                     }
                     exportButton.setEnabled(!clips.isEmpty());
+                    thumbnailPromptButton.setEnabled(!clips.isEmpty());
                     log(i18n.format("log.foundClips", clips.size()));
                 } catch (Exception ex) {
                     showError(ex);
@@ -358,6 +376,172 @@ public final class ShortsCreatorApp {
         activeWorker = worker;
         bindProgress(worker);
         worker.execute();
+    }
+
+    private void generateThumbnailPrompts() {
+        if (currentInput == null || currentOutputDirectory == null) {
+            JOptionPane.showMessageDialog(frame, i18n.text("dialog.analyzeFirst"));
+            return;
+        }
+
+        List<ClipCandidate> clips = clipList.getSelectedValuesList();
+        if (clips.isEmpty()) {
+            JOptionPane.showMessageDialog(frame, i18n.text("dialog.selectClip"));
+            return;
+        }
+
+        setBusy(true);
+        log(i18n.format("log.thumbnailGenerating", clips.size()));
+        String gameTitle = blankFallback(gameTitleField.getText(), "[GAME TITLE]");
+        String partNumber = blankFallback(partNumberField.getText(), "[PART NUMBER]");
+        String partMarker = partMarker(partNumber);
+
+        SwingWorker<Void, String> worker = new SwingWorker<>() {
+            @Override
+            protected Void doInBackground() throws Exception {
+                for (int i = 0; i < clips.size(); i++) {
+                    if (isCancelled()) {
+                        return null;
+                    }
+                    ClipCandidate clip = clips.get(i);
+                    Path directory = currentOutputDirectory.resolve("thumbnail_prompts")
+                            .resolve(String.format("short_%02d", clip.index()));
+                    List<Path> frames = extractThumbnailFrames(clip, directory);
+                    Path prompt = writeThumbnailPrompt(clip, directory, frames, gameTitle, partMarker);
+                    publish(i18n.format("log.thumbnailSaved", prompt));
+                    setProgress((int) Math.round(((i + 1) / (double) clips.size()) * 100));
+                }
+                return null;
+            }
+
+            @Override
+            protected void process(List<String> chunks) {
+                chunks.forEach(ShortsCreatorApp.this::log);
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    if (isCancelled()) {
+                        log(i18n.text("log.thumbnailCancelled"));
+                        return;
+                    }
+                    get();
+                    log(i18n.text("log.thumbnailComplete"));
+                } catch (Exception ex) {
+                    showError(ex);
+                } finally {
+                    activeWorker = null;
+                    setBusy(false);
+                    if (!isCancelled()) {
+                        progressBar.setValue(100);
+                    }
+                }
+            }
+        };
+        activeWorker = worker;
+        bindProgress(worker);
+        worker.execute();
+    }
+
+    private List<Path> extractThumbnailFrames(ClipCandidate clip, Path directory) throws IOException, InterruptedException {
+        List<Path> frames = new ArrayList<>();
+        double[] offsets = {
+                Math.max(0.2, clip.durationSeconds() * 0.20),
+                Math.max(0.2, clip.durationSeconds() * 0.50),
+                Math.max(0.2, clip.durationSeconds() * 0.80)
+        };
+        for (int i = 0; i < offsets.length; i++) {
+            frames.add(ffmpeg.extractThumbnailFrame(currentInput, directory, clip, i + 1, offsets[i]));
+        }
+        return frames;
+    }
+
+    private Path writeThumbnailPrompt(ClipCandidate clip, Path directory, List<Path> frames,
+                                      String gameTitle, String partMarker) throws IOException {
+        Files.createDirectories(directory);
+        Path prompt = directory.resolve(String.format("short_%02d_thumbnail_prompt.txt", clip.index()));
+        String content = """
+                I need a YouTube Shorts title and a thumbnail.
+
+                Look at the attached video frames and infer what is happening in this specific moment.
+                Generate titles based on the visible event, mood, action, surprise, failure, reaction, or funny situation in the frames.
+                Do not use generic template titles.
+
+                First, generate title ideas:
+                - 20 Russian YouTube Shorts title options
+                - 10 English YouTube Shorts title options
+                - Titles should be emotional, funny, intriguing, and clickable
+                - Include the game context naturally
+                - Use this exact title format for Russian title options: %s — %s | <title>
+                - Use this exact title format for English title options too, keeping the game title and part marker unchanged
+                - Do not make the titles too long
+                - Avoid generic titles like "Funny moment" or "Gameplay highlight"
+
+                Then create a YouTube thumbnail in 16:9 format, 1280x720.
+
+                Use the attached video frames as the base context.
+                I will also attach photos of my cat. Add my cat as a meaningful part of the thumbnail story, not just as a random sticker.
+
+                Required elements:
+                - Game logo for: %s
+                - Part marker: %s
+                - My cat integrated into the scene as a funny/dramatic reaction character
+                - One short Russian text phrase
+                - One short English text phrase
+                - Big readable typography, YouTube-style
+                - Bright, high contrast, clickable composition
+                - Keep the final image in strict 16:9 landscape format
+
+                Suggested text direction:
+                - Russian text: make it emotional, funny, or intriguing
+                - English text: short punchy phrase, not a direct boring translation
+
+                Avoid:
+                - vertical format
+                - tiny unreadable text
+                - too much text
+                - hiding the game logo
+                - making the cat look pasted randomly
+
+                Clip info:
+                - Range: %s
+                - Score: %.4f
+
+                Attached frames:
+                %s
+                """.formatted(
+                gameTitle,
+                partMarker,
+                gameTitle,
+                partMarker,
+                clip.displayRange(),
+                clip.score(),
+                frameListText(frames)
+        );
+        Files.writeString(prompt, content);
+        return prompt;
+    }
+
+    private String partMarker(String partNumber) {
+        String number = blankFallback(partNumber, "?").replaceFirst("^#+", "");
+        VideoPartTypeOption option = (VideoPartTypeOption) partTypeComboBox.getSelectedItem();
+        if (option != null && option.stream()) {
+            return "стрим #" + number;
+        }
+        return "#" + number;
+    }
+
+    private String frameListText(List<Path> frames) {
+        StringBuilder builder = new StringBuilder();
+        for (Path frame : frames) {
+            builder.append("- ").append(frame.getFileName()).append(System.lineSeparator());
+        }
+        return builder.toString();
+    }
+
+    private String blankFallback(String value, String fallback) {
+        return value == null || value.isBlank() ? fallback : value.trim();
     }
 
     private ExportSettings readSettings() {
@@ -664,6 +848,7 @@ public final class ShortsCreatorApp {
     private void setBusy(boolean busy) {
         analyzeButton.setEnabled(!busy);
         exportButton.setEnabled(!busy && !clipModel.isEmpty());
+        thumbnailPromptButton.setEnabled(!busy && !clipModel.isEmpty());
         cancelButton.setEnabled(busy);
         if (busy) {
             progressBar.setValue(0);
@@ -712,6 +897,8 @@ public final class ShortsCreatorApp {
         frame.setTitle(i18n.text("app.title"));
         videoLabel.setText(i18n.text("label.video"));
         outputLabel.setText(i18n.text("label.output"));
+        gameTitleLabel.setText(i18n.text("label.gameTitle"));
+        partNumberLabel.setText(i18n.text("label.partNumber"));
         audioTracksLabel.setText(i18n.text("label.audioTracks"));
         shortsLabel.setText(i18n.text("label.shorts"));
         lengthLabel.setText(i18n.text("label.length"));
@@ -728,11 +915,13 @@ public final class ShortsCreatorApp {
         }
         analyzeButton.setText(i18n.text("button.analyze"));
         exportButton.setText(i18n.text("button.export"));
+        thumbnailPromptButton.setText(i18n.text("button.thumbnailPrompt"));
         cancelButton.setText(i18n.text("button.cancel"));
         allMomentsCheckBox.setText(i18n.text("checkbox.allMoments"));
         clipsBorder.setTitle(i18n.text("border.detectedMoments"));
         logsBorder.setTitle(i18n.text("border.log"));
         refreshAnalysisEngineOptions();
+        refreshPartTypeOptions();
         selectLanguageOption();
         frame.revalidate();
         frame.repaint();
@@ -771,6 +960,19 @@ public final class ShortsCreatorApp {
         return option == null ? AnalysisEngine.AUTO : option.engine();
     }
 
+    private void refreshPartTypeOptions() {
+        boolean stream = selectedPartTypeIsStream();
+        partTypeComboBox.removeAllItems();
+        partTypeComboBox.addItem(new VideoPartTypeOption(false, i18n.text("partType.part")));
+        partTypeComboBox.addItem(new VideoPartTypeOption(true, i18n.text("partType.stream")));
+        partTypeComboBox.setSelectedIndex(stream ? 1 : 0);
+    }
+
+    private boolean selectedPartTypeIsStream() {
+        VideoPartTypeOption option = (VideoPartTypeOption) partTypeComboBox.getSelectedItem();
+        return option != null && option.stream();
+    }
+
     private void refreshAnalysisEngineOptions() {
         AnalysisEngine selected = selectedAnalysisEngine();
         analysisEngineComboBox.removeAllItems();
@@ -801,6 +1003,13 @@ public final class ShortsCreatorApp {
     }
 
     private record AnalysisEngineOption(AnalysisEngine engine, String displayName) {
+        @Override
+        public String toString() {
+            return displayName;
+        }
+    }
+
+    private record VideoPartTypeOption(boolean stream, String displayName) {
         @Override
         public String toString() {
             return displayName;

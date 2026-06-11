@@ -280,6 +280,31 @@ public final class FfmpegService {
         return exportClip(inputFile, outputDirectory, clip, totalCount, List.of());
     }
 
+    public Path extractThumbnailFrame(Path inputFile, Path outputDirectory, ClipCandidate clip, int frameNumber,
+                                      double offsetSeconds)
+            throws IOException, InterruptedException {
+        Files.createDirectories(outputDirectory);
+        String name = String.format(Locale.US, "short_%02d_frame_%02d.jpg", clip.index(), frameNumber);
+        Path output = outputDirectory.resolve(name);
+        double timestamp = Math.max(0, clip.startSeconds() + Math.min(offsetSeconds, Math.max(0, clip.durationSeconds() - 0.1)));
+        List<String> command = List.of(
+                ffmpegCommand(),
+                "-y",
+                "-v", "error",
+                "-ss", formatSeconds(timestamp),
+                "-i", inputFile.toString(),
+                "-frames:v", "1",
+                "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1",
+                "-q:v", "2",
+                output.toString()
+        );
+        ProcessResult result = runAndCapture(command);
+        if (!result.isSuccess()) {
+            throw new IOException("Thumbnail frame extraction failed:\n" + result.output());
+        }
+        return output;
+    }
+
     private double estimateVisualFocusX(Path inputFile, ClipCandidate clip) throws IOException, InterruptedException {
         List<String> command = List.of(
                 ffmpegCommand(),

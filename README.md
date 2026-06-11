@@ -13,6 +13,7 @@ The app uses FFmpeg for media work and audio/visual heuristics to find candidate
 - lets you cancel long analysis/export jobs without closing the app
 - supports English and Russian, with language switching inside the app
 - can optionally use `analysis\analyze.py` for Python-based analysis, with automatic Java fallback
+- generates ready-to-copy title/thumbnail prompts and 16:9 reference frames for ChatGPT
 - estimates the most active horizontal area of each clip instead of always center-cropping
 - exports vertical 1080x1920 `.mp4` files for YouTube Shorts
 - saves clips into an output folder named after the source video file
@@ -100,6 +101,12 @@ The app uses FFmpeg for media work and audio/visual heuristics to find candidate
    - maximum duration
    - analysis engine: `Auto`, `Java`, or `Python`
 
+   You can also fill:
+
+   - game title
+   - part number
+   - type: regular part or stream
+
 11. Click `Analyze`.
 
    The log will show either:
@@ -122,7 +129,31 @@ The app uses FFmpeg for media work and audio/visual heuristics to find candidate
 
    The app exports separate vertical 1080x1920 `.mp4` shorts into the output folder.
 
-14. Stop long work if needed.
+14. Optional: create title and thumbnail prompts.
+
+   Select one or more detected moments and click `Title + thumbnail prompt`.
+
+   For each selected moment, the app saves:
+
+   - three 16:9 reference frames
+   - a ready-to-copy prompt for ChatGPT with title and thumbnail instructions
+
+   The prompt asks ChatGPT to generate 20 Russian titles based on the attached frames and visible events, using this format:
+
+   ```text
+   Game title — #part | title
+   Game title — stream #part | title
+   ```
+
+   Files are saved under:
+
+   ```text
+   <output folder>\thumbnail_prompts\short_XX
+   ```
+
+   Attach the saved frames and your cat photos to ChatGPT, then paste the generated prompt.
+
+15. Stop long work if needed.
 
    Use `Cancel` to stop analysis or export without closing the app.
 
